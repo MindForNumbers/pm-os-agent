@@ -42,6 +42,8 @@ How to finish a run. End with exactly one of:
         proposed-stories status if any>
   ESCALATE: <one line on why a human must take it from here>
 Always show the data you relied on so a human can check you.
+A DONE draft must end with one final line, `STATUS: Green`, `STATUS: Yellow`, or
+`STATUS: Red`: your proposed status. The human makes the final status call.
 """
 
 CRITIC_SYSTEM = """\
