@@ -44,9 +44,9 @@ Not a goal loop, so no self-validation step: the independent critic grades the o
 | **Escalate to human** | Any of: (1) the critic rejects the draft 2× (revision cap, `CORTEX_MAX_REVISIONS=2`) → M1 #3; (2) the proposed status would change color vs. last approved update → #4 Above; (3) an open Sev-1 or launch hold → #6 Above; (4) a confidential/embargoed project (e.g. Orbit) is in scope → #8b Above; (5) a story fails the PRD check or would exceed the cap of 10 → #7 HITL; (6) a possible prompt injection in the brief. | Stop at the HITL checkpoint and ping me with one `ESCALATE:` line saying why, plus whatever was safely finished (e.g. the draft saved, marked "needs your call"). **Write the marker**: escalate means the run worked and handed me a decision, so a rerun would just re-ping me. `--force` still covers a fresh run after I decide. |
 
 **Build status** (spec vs. `00-build/agent.py`):
-- **Enforced in code:** stuck triggers 1–4 (tool fails 3×, iteration cap, cost cap, no progress); escalate on revision cap and on a status color change vs. the last approved update (a draft with no `STATUS:` line also escalates, so the check can't be skipped); the per-project daily marker + human-only `--force` (logged who/why/when); the story-batch cap of 10 (`tools.py`).
+- **Enforced in code:** stuck triggers 1–4 (tool fails 3×, iteration cap, cost cap, no progress); escalate on revision cap and on a status color change vs. the last approved update (a draft with no `STATUS:` line also escalates, so the check can't be skipped); the per-project daily marker + human-only `--force` (logged who/why/when); the story-batch cap of 10 (`tools.py`); the critic's "possibly missed" list (critic check e, built in M3).
 - **Enforced by prompt + critic; code enforcement in M5:** Sev-1 / launch hold, confidential/embargoed project, story fails the PRD check, prompt injection.
-- **Designed, not yet built:** daily vs. Monday modes (every run today is Monday mode); pings (stubbed in the trace as `PING -> owner (not wired)`, on stuck and escalate); the critic's "possibly missed" list (so the quiet-day rule can't run yet).
+- **Designed, not yet built:** daily vs. Monday modes (every run today is Monday mode, so the quiet-day rule can't run yet); pings (stubbed in the trace as `PING -> owner (not wired)`, on stuck and escalate).
 
 ## 4. State
 
