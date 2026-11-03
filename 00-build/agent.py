@@ -117,6 +117,15 @@ def banner(text: str) -> None:
 
 STATE_DIR = OUTPUT_DIR / "state"
 
+# Tiered fail action (Orchestration Map §5). b = above-the-line commitment,
+# c = confidential leak: Above risks from M1, never revised, always to the human.
+BLOCK_CHECKS = {"b", "c"}
+
+
+def fail_action(failed_checks) -> str:
+    """'block' (escalate now, nothing back to Cortex) on b/c; otherwise 'revise'."""
+    return "block" if BLOCK_CHECKS & set(failed_checks or []) else "revise"
+
 
 def project_id_from(task_body: str) -> str:
     """Read the project ID (e.g. P-NORTH) from the brief before any model call, so a
@@ -231,6 +240,7 @@ def run(which: str = "happy", *, force: bool = False, force_reason: str = "") ->
 
     client = OpenAI()
     bounds = Bounds()
+    verdict_log: list[dict] = []   # every critic verdict, logged on every exit
 
     def finish(kind: str, reason: str, draft: str) -> None:
         """Every exit goes through here (Loop Spec §3).
@@ -238,7 +248,8 @@ def run(which: str = "happy", *, force: bool = False, force_reason: str = "") ->
         stuck: the run broke, so no marker; a retry or --force can still finish."""
         emit_deliverable(which, draft, kind=kind, reason=reason, cost=bounds.cost)
         state["run_log"].append({"date": today, "outcome": kind, "reason": reason,
-                                 "cost_usd": round(bounds.cost, 4)})
+                                 "cost_usd": round(bounds.cost, 4),
+                                 "verdicts": verdict_log})
         if kind in ("stuck", "escalate"):
             ping(f"{project_id} {kind.upper()}: {reason}")
         if kind in ("success", "escalate"):
@@ -317,7 +328,9 @@ def run(which: str = "happy", *, force: bool = False, force_reason: str = "") ->
         # Estimate critic spend too.
         bounds.cost += (verdict["_usage"]["prompt"] * PRICE_IN
                         + verdict["_usage"]["completion"] * PRICE_OUT) / 1_000_000
-        print(json.dumps({k: v for k, v in verdict.items() if k != "_usage"}, indent=2))
+        shown = {k: v for k, v in verdict.items() if k != "_usage"}
+        verdict_log.append(shown)
+        print(json.dumps(shown, indent=2))
 
         if verdict["verdict"] == "pass":
             escalation = escalation_line(proposed)
@@ -347,6 +360,15 @@ def run(which: str = "happy", *, force: bool = False, force_reason: str = "") ->
                    f"Run cost ≈ ${bounds.cost:.4f}")
             note = f"; status {color} matches last approved ({prior[1]})" if prior else ""
             finish("success", "validator passed" + note, proposed)
+            return
+
+        if fail_action(verdict.get("failed_checks")) == "block":
+            checks = ", ".join(sorted(BLOCK_CHECKS & set(verdict["failed_checks"])))
+            reason = (f"critic BLOCKED on check {checks} (Above risk, not revised): "
+                      + "; ".join(verdict.get("reasons", []))[:300])
+            banner(f"BLOCKED by critic on check {checks}. Nothing sent back to Cortex; "
+                   f"escalating to a human. Run cost ≈ ${bounds.cost:.4f}")
+            finish("escalate", reason, proposed)
             return
 
         if revisions >= MAX_REVISIONS:

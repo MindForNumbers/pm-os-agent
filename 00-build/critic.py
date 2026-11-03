@@ -11,7 +11,8 @@ from prompts import CRITIC_SYSTEM
 
 
 def review(client, model: str, proposed_output: str, source_data: str) -> dict:
-    """Return {"verdict": "pass"|"fail", "reasons": [...]} for a proposed output."""
+    """Return {"verdict", "failed_checks", "reasons", "possibly_missed"} for a proposed
+    output. Each call is a fresh context: no drafting conversation, no earlier verdict."""
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -29,9 +30,12 @@ def review(client, model: str, proposed_output: str, source_data: str) -> dict:
                     "type": "object",
                     "properties": {
                         "verdict": {"type": "string", "enum": ["pass", "fail"]},
+                        "failed_checks": {"type": "array", "items": {
+                            "type": "string", "enum": ["a", "b", "c", "d", "e"]}},
                         "reasons": {"type": "array", "items": {"type": "string"}},
+                        "possibly_missed": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["verdict", "reasons"],
+                    "required": ["verdict", "failed_checks", "reasons", "possibly_missed"],
                     "additionalProperties": False,
                 },
             },
@@ -41,6 +45,9 @@ def review(client, model: str, proposed_output: str, source_data: str) -> dict:
     try:
         verdict = json.loads(resp.choices[0].message.content)
     except (json.JSONDecodeError, TypeError):
-        verdict = {"verdict": "fail", "reasons": ["critic returned unparseable output"]}
+        verdict = {"verdict": "fail", "failed_checks": [], "possibly_missed": [],
+                   "reasons": ["critic returned unparseable output"]}
+    if verdict.get("failed_checks"):  # a named failed check always means fail
+        verdict["verdict"] = "fail"
     verdict["_usage"] = {"prompt": usage.prompt_tokens, "completion": usage.completion_tokens}
     return verdict
