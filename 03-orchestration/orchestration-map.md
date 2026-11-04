@@ -106,7 +106,7 @@ The old jailbreak check was dropped on purpose: a successful injection would sur
 
 | | What | Who sees it |
 |---|---|---|
-| **Shared** | Source data: the brief + every tool result (project, activity, past updates, roadmap, norms) | Both, read-only. The critic has to see the full source data, including the confidential roadmap, or check c couldn't catch a leak. |
+| **Shared** | Source data: the brief + every tool result (project, activity, past updates, roadmap, norms) | Both, read-only. The critic also gets the confidential/embargoed names list (refined in M4 §2): it needs the names, not the full confidential sections, for check c to catch a leak. |
 | **Shared** | The output under review (draft or escalation) | Both: Cortex wrote it, the critic judges it. |
 | **Isolated: Cortex only** | Cortex's conversation and reasoning | Never the critic. |
 | **Isolated: critic only** | The critic's reasoning and earlier verdicts | Not Cortex (reasons only, and only on a revise). Not the critic's own next call (every check is fresh). |
