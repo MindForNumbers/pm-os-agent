@@ -4,8 +4,9 @@ directing your coding agent (Claude Code / Cursor / Codex) to shape this file. Y
 never have to hand-write it.
 
 Every bound the course talks about is visible right here in code, not buried in a
-framework: the max-iteration counter, the cost cap, the revision cap, the
-stop/escalate conditions, the auto-queue cap, and the absence of any publish tool.
+framework: the max-iteration counter, the per-run and daily cost caps, the timeout,
+the revision cap, the stop/escalate conditions, the auto-queue cap, and the absence
+of any publish tool.
 
 Usage (ask your coding agent to run these for you, or run them yourself):
     python agent.py                # runs the happy-path task (weekly status update)
@@ -31,15 +32,14 @@ import getpass
 import json
 import os
 import re
+import time
 from datetime import date, datetime
 from pathlib import Path
 
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
 
-import tools
-from critic import review
-from prompts import CORTEX_SYSTEM
-
+# Load .env BEFORE importing tools: tools.py reads its bounds (the story cap) at
+# import time, and a gate that silently ignores .env looks enforced and isn't.
 try:  # load .env if python-dotenv is installed; harmless if it isn't
     from dotenv import load_dotenv
 
@@ -47,18 +47,28 @@ try:  # load .env if python-dotenv is installed; harmless if it isn't
 except ImportError:
     pass
 
+import tools  # noqa: E402
+from critic import review  # noqa: E402
+from prompts import CORTEX_SYSTEM  # noqa: E402
+
 # --- Bounds (your M5 deliverable: tune these and justify them) ----------------
 MODEL = os.environ.get("CORTEX_MODEL", "gpt-4o-mini")
-MAX_ITERATIONS = int(os.environ.get("CORTEX_MAX_ITERATIONS", "8"))
+MAX_ITERATIONS = int(os.environ.get("CORTEX_MAX_ITERATIONS", "7"))
 MAX_REVISIONS = int(os.environ.get("CORTEX_MAX_REVISIONS", "2"))
-COST_CAP_USD = float(os.environ.get("CORTEX_COST_CAP_USD", "0.50"))
-MAX_QUEUE_ITEMS = int(os.environ.get("CORTEX_MAX_QUEUE_ITEMS", "10"))
+COST_CAP_USD = float(os.environ.get("CORTEX_COST_CAP_USD", "0.02"))
+DAILY_CAP_USD = float(os.environ.get("CORTEX_DAILY_CAP_USD", "0.25"))  # all projects, per day
+TIMEOUT_S = float(os.environ.get("CORTEX_TIMEOUT_S", "90"))           # wall clock, per run
+MAX_QUEUE_ITEMS = int(os.environ.get("CORTEX_MAX_QUEUE_ITEMS", "5"))
 # Rough $ per 1M tokens for your chosen model, set to match its pricing.
 PRICE_IN = float(os.environ.get("CORTEX_PRICE_IN_PER_M", "0.15"))
 PRICE_OUT = float(os.environ.get("CORTEX_PRICE_OUT_PER_M", "0.60"))
 # Stuck triggers from the Loop Spec (02-loop-design/loop-spec.md §3).
 MAX_TOOL_FAILS = int(os.environ.get("CORTEX_MAX_TOOL_FAILS", "3"))     # data can't be pulled
 MAX_NO_PROGRESS = int(os.environ.get("CORTEX_MAX_NO_PROGRESS", "2"))   # going in circles
+# Required sources (M4 withheld-source finding): a run can't succeed unless each of
+# these was called AND returned data. Another source holding a stale second copy of
+# the same facts (the roadmap's 41% -> 43%) doesn't count.
+REQUIRED_SOURCES = ("get_project", "get_activity")
 
 TOOL_SCHEMAS = [
     {"type": "function", "function": {
@@ -94,18 +104,48 @@ TOOL_SCHEMAS = [
 ]
 
 
+def load_spend() -> dict:
+    """Daily spend ledger shared by ALL projects: {"YYYY-MM-DD": dollars}."""
+    path = STATE_DIR / "_spend.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def record_spend(day: str, dollars: float) -> None:
+    ledger = load_spend()
+    ledger[day] = round(ledger.get(day, 0.0) + dollars, 6)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / "_spend.json").write_text(json.dumps(ledger, indent=2))
+
+
 class Bounds:
-    """Tracks spend and trips the cost cap. This is enforced OUTSIDE the model."""
+    """Tracks spend and wall clock and trips the caps. All enforced OUTSIDE the model."""
 
     def __init__(self):
         self.cost = 0.0
+        self.started = time.monotonic()
+        self.today = date.today().isoformat()
+        self.spent_before = load_spend().get(self.today, 0.0)
+
+    def charge(self, prompt_tokens: int, completion_tokens: int) -> None:
+        dollars = (prompt_tokens * PRICE_IN + completion_tokens * PRICE_OUT) / 1_000_000
+        self.cost += dollars
+        # Written after every API call, so a crash loses at most one call's spend.
+        record_spend(self.today, dollars)
 
     def add(self, usage) -> None:
-        self.cost += (usage.prompt_tokens * PRICE_IN
-                      + usage.completion_tokens * PRICE_OUT) / 1_000_000
+        self.charge(usage.prompt_tokens, usage.completion_tokens)
 
     def over_cap(self) -> bool:
         return self.cost >= COST_CAP_USD
+
+    def over_daily_cap(self) -> bool:
+        return self.spent_before + self.cost >= DAILY_CAP_USD
+
+    def remaining_s(self) -> float:
+        return TIMEOUT_S - (time.monotonic() - self.started)
+
+    def timed_out(self) -> bool:
+        return self.remaining_s() <= 0
 
 
 OUTPUT_DIR = Path(__file__).parent / "run-output"
@@ -116,6 +156,15 @@ def banner(text: str) -> None:
 
 
 STATE_DIR = OUTPUT_DIR / "state"
+
+# Kill switch (M5): a file outside the model, checked before every model call and
+# every tool call. The owner or eng on-call creates it to halt; only the owner
+# deletes it to turn Cortex back on.
+KILL_FILE = STATE_DIR / "KILL"
+
+
+def kill_switch_on() -> bool:
+    return KILL_FILE.exists()
 
 # Tiered fail action (Orchestration Map §5). b = above-the-line commitment,
 # c = confidential leak: Above risks from M1, never revised, always to the human.
@@ -171,6 +220,30 @@ def proposed_status(draft: str) -> str | None:
     """Color from the draft's final `STATUS: <color>` line (required by prompts.py)."""
     found = re.findall(r"STATUS:\s*\**\s*(Green|Yellow|Red)\b", draft, re.IGNORECASE)
     return found[-1].capitalize() if found else None
+
+
+# Pre-authorization claims (M1 row, M5). SIGNAL ONLY, never blocks: rephrasing gets
+# past any phrase list. The real block is that a claim can't mint a JIT write token.
+PREAUTH_PATTERNS = [
+    r"pre-?\s?(authori[sz]ed|approved)",
+    r"already (been )?(approved|authori[sz]ed|signed off)",
+    r"(you are|you're) (now )?authori[sz]ed",
+    r"ignore (all )?(your |previous |prior )*(rules|instructions|norms)",
+    r"system override|admin mode",
+    r"do not escalate|don't escalate|no need to (ask|wait for) approval",
+    r"skip (the )?(review|approval)",
+]
+
+
+def preauth_signals(text: str, source: str) -> list[str]:
+    """Each pattern that matches, as 'source: "matched text"' for the human to review."""
+    hits = []
+    text = re.sub(r"\s+", " ", text)   # phrases wrap across lines in pasted briefs
+    for pattern in PREAUTH_PATTERNS:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            hits.append(f'{source}: "{m.group(0)}"')
+    return hits
 
 
 def escalation_line(output: str) -> str | None:
@@ -240,16 +313,31 @@ def run(which: str = "happy", *, force: bool = False, force_reason: str = "") ->
 
     client = OpenAI()
     bounds = Bounds()
+    tools.reset_run()   # the story cap counts per run, across calls
     verdict_log: list[dict] = []   # every critic verdict, logged on every exit
+    signals: list[str] = preauth_signals(task["body"], "brief")   # signal only
 
     def finish(kind: str, reason: str, draft: str) -> None:
         """Every exit goes through here (Loop Spec §3).
         success / escalate: the run worked, so write today's marker LAST.
-        stuck: the run broke, so no marker; a retry or --force can still finish."""
+        stuck: the run broke, so no marker; a retry or --force can still finish.
+        stuck also rolls back: an unreviewed write in a trusted queue is still a
+        write, so a broken run leaves 0 stories queued (escalate keeps them for HITL)."""
+        withdrawn: list[str] = []
+        if kind == "stuck":
+            withdrawn = tools.withdraw_run()
+            reason += (f"; {len(withdrawn)} queued stories withdrawn (simulated, stories "
+                       f"only live in the run output)")
         emit_deliverable(which, draft, kind=kind, reason=reason, cost=bounds.cost)
+        if signals:
+            banner("FLAG FOR YOUR REVIEW: possible pre-authorization claim (signal only, "
+                   "it authorizes nothing, only your approval mints a write token)")
+            print("\n".join(f"- {s}" for s in signals))
         state["run_log"].append({"date": today, "outcome": kind, "reason": reason,
                                  "cost_usd": round(bounds.cost, 4),
-                                 "verdicts": verdict_log})
+                                 "verdicts": verdict_log,
+                                 "preauth_signals": signals,
+                                 "stories_withdrawn": withdrawn})
         if kind in ("stuck", "escalate"):
             ping(f"{project_id} {kind.upper()}: {reason}")
         if kind in ("success", "escalate"):
@@ -260,6 +348,25 @@ def run(which: str = "happy", *, force: bool = False, force_reason: str = "") ->
            f"(auto-queue cap {MAX_QUEUE_ITEMS} items)")
     print(task["body"])
 
+    def halt_killed(where: str, draft: str) -> None:
+        """Halt + roll back (finish() withdraws the queued stories), hold the draft, ping."""
+        reason = (f"kill switch tripped {where}; "
+                  f"no JIT tokens outstanding (post_team_update not built)")
+        banner(f"KILLED, {reason}. Run cost ≈ ${bounds.cost:.4f}")
+        finish("stuck", reason, draft)
+
+    # Kill switch and daily cap are checked before any API spend.
+    if kill_switch_on():
+        halt_killed("before start", "")
+        return
+
+    if bounds.over_daily_cap():
+        reason = (f"daily cap ${DAILY_CAP_USD} already spent today "
+                  f"(${bounds.spent_before:.4f}), refusing to start")
+        banner(f"STUCK, {reason}.")
+        finish("stuck", reason, "")
+        return
+
     messages = [
         {"role": "system", "content": CORTEX_SYSTEM},
         {"role": "user", "content": f"PM task brief:\n\n{task['body']}"},
@@ -267,19 +374,43 @@ def run(which: str = "happy", *, force: bool = False, force_reason: str = "") ->
     source_log: list[str] = [task["body"]]
     revisions = 0
     last_draft = ""
-    tool_fail_streak = 0      # stuck trigger 1
+    tool_fail_streaks: dict[str, int] = {}   # stuck trigger 1, per tool
     no_progress_streak = 0    # stuck trigger 4
     seen_calls: set[str] = set()
+    failed_calls: set[str] = set()   # a retry of a failed call is progress, not a circle
+    pulled: set[str] = set()         # tools that returned data, for REQUIRED_SOURCES
 
     for step in range(1, MAX_ITERATIONS + 1):
+        if kill_switch_on():
+            halt_killed(f"at step {step}", last_draft)
+            return
         if bounds.over_cap():
             reason = f"cost cap ${COST_CAP_USD} hit at ${bounds.cost:.4f}"
             banner(f"STUCK, {reason}. Halting.")
             finish("stuck", reason, last_draft)
             return
+        if bounds.over_daily_cap():
+            reason = (f"daily cap ${DAILY_CAP_USD} hit at "
+                      f"${bounds.spent_before + bounds.cost:.4f} today")
+            banner(f"STUCK, {reason}. Halting.")
+            finish("stuck", reason, last_draft)
+            return
+        if bounds.timed_out():
+            reason = f"timeout ({TIMEOUT_S:.0f}s) reached"
+            banner(f"STUCK, {reason}. Halting. Run cost ≈ ${bounds.cost:.4f}")
+            finish("stuck", reason, last_draft)
+            return
 
-        resp = client.chat.completions.create(
-            model=MODEL, messages=messages, tools=TOOL_SCHEMAS)
+        # Each request only gets the run's remaining time, no SDK retries, so a hung
+        # call can't stretch the run past TIMEOUT_S.
+        try:
+            resp = client.with_options(timeout=bounds.remaining_s(), max_retries=0) \
+                .chat.completions.create(model=MODEL, messages=messages, tools=TOOL_SCHEMAS)
+        except APITimeoutError:
+            reason = f"timeout ({TIMEOUT_S:.0f}s) reached during a model call"
+            banner(f"STUCK, {reason}. Halting. Run cost ≈ ${bounds.cost:.4f}")
+            finish("stuck", reason, last_draft)
+            return
         bounds.add(resp.usage)
         msg = resp.choices[0].message
 
@@ -287,21 +418,37 @@ def run(which: str = "happy", *, force: bool = False, force_reason: str = "") ->
             messages.append(msg)
             made_new_call = False
             for call in msg.tool_calls:
+                if kill_switch_on():
+                    halt_killed(f"before a tool call at step {step}", last_draft)
+                    return
                 fn = call.function.name
                 args = json.loads(call.function.arguments or "{}")
                 key = f"{fn}:{json.dumps(args, sort_keys=True)}"
-                made_new_call = made_new_call or key not in seen_calls
+                # Retries are still capped by MAX_TOOL_FAILS and MAX_ITERATIONS.
+                made_new_call = (made_new_call or key not in seen_calls
+                                 or key in failed_calls)
                 seen_calls.add(key)
                 result = tools.TOOLS[fn](**args)
-                tool_fail_streak = tool_fail_streak + 1 if "error" in result else 0
+                # Per tool: another tool succeeding must not hide one source failing.
+                tool_fail_streaks[fn] = (tool_fail_streaks.get(fn, 0) + 1
+                                         if "error" in result else 0)
+                if "error" in result:
+                    failed_calls.add(key)
+                else:
+                    failed_calls.discard(key)
+                    pulled.add(fn)
                 source_log.append(f"{fn}({args}) -> {json.dumps(result)}")
+                signals.extend(s for s in preauth_signals(json.dumps(result), fn)
+                               if s not in signals)
                 print(f"\n[step {step}] TOOL {fn}({args})")
                 print(f"          -> {json.dumps(result)[:300]}")
                 messages.append({"role": "tool", "tool_call_id": call.id,
                                  "content": json.dumps(result)})
             no_progress_streak = 0 if made_new_call else no_progress_streak + 1
-            if tool_fail_streak >= MAX_TOOL_FAILS:
-                reason = f"tool calls failed {tool_fail_streak}x in a row (data can't be pulled)"
+            failing = [t for t, n in tool_fail_streaks.items() if n >= MAX_TOOL_FAILS]
+            if failing:
+                reason = (f"{failing[0]} failed {tool_fail_streaks[failing[0]]}x in a row "
+                          f"(data can't be pulled)")
                 banner(f"STUCK, {reason}. Halting.")
                 finish("stuck", reason, last_draft)
                 return
@@ -323,11 +470,21 @@ def run(which: str = "happy", *, force: bool = False, force_reason: str = "") ->
             finish("stuck", reason, last_draft)
             return
 
+        if kill_switch_on():
+            halt_killed(f"before the critic call at step {step}", last_draft)
+            return
         banner("CRITIC, independent validation")
-        verdict = review(client, MODEL, proposed, "\n".join(source_log))
+        try:
+            verdict = review(client.with_options(timeout=max(bounds.remaining_s(), 0.1),
+                                                 max_retries=0),
+                             MODEL, proposed, "\n".join(source_log))
+        except APITimeoutError:
+            reason = f"timeout ({TIMEOUT_S:.0f}s) reached during the critic call"
+            banner(f"STUCK, {reason}. Halting. Run cost ≈ ${bounds.cost:.4f}")
+            finish("stuck", reason, last_draft)
+            return
         # Estimate critic spend too.
-        bounds.cost += (verdict["_usage"]["prompt"] * PRICE_IN
-                        + verdict["_usage"]["completion"] * PRICE_OUT) / 1_000_000
+        bounds.charge(verdict["_usage"]["prompt"], verdict["_usage"]["completion"])
         shown = {k: v for k, v in verdict.items() if k != "_usage"}
         verdict_log.append(shown)
         print(json.dumps(shown, indent=2))
@@ -352,6 +509,13 @@ def run(which: str = "happy", *, force: bool = False, force_reason: str = "") ->
             if prior and color != prior[0]:
                 reason = (f"status would change {prior[0]} -> {color} vs last approved "
                           f"update ({prior[1]}); your call (M1 #4)")
+                banner(f"ESCALATE, {reason}. Draft saved, needs your call.")
+                finish("escalate", reason, proposed)
+                return
+            missing = [t for t in REQUIRED_SOURCES if t not in pulled]
+            if missing:
+                reason = (f"required source {', '.join(missing)} never returned data, so "
+                          f"the draft can't be grounded (M4 withheld-source rule)")
                 banner(f"ESCALATE, {reason}. Draft saved, needs your call.")
                 finish("escalate", reason, proposed)
                 return

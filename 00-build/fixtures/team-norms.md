@@ -25,7 +25,7 @@
   than committing one.
 
 ## Backlog rules
-- Propose at most **10 stories** per run (`CORTEX_MAX_QUEUE_ITEMS`). Larger batches go
+- Propose at most **5 stories** per run (`CORTEX_MAX_QUEUE_ITEMS`). Larger batches go
   to **sprint planning** to be sized, escalate instead of splitting to dodge the cap.
 - Stories must trace to an in-scope PRD item. No scope the PRD marks out of scope.
 

@@ -22,7 +22,47 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # Commitment bound (M5). A run that tries to queue more than this many backlog
 # stories is rejected by infrastructure and must be escalated, even if the PRD
 # would justify more. Auto-committing a flood of "real" work is the money analog.
-MAX_QUEUE_ITEMS = int(os.environ.get("CORTEX_MAX_QUEUE_ITEMS", "10"))
+MAX_QUEUE_ITEMS = int(os.environ.get("CORTEX_MAX_QUEUE_ITEMS", "5"))
+# Counted across ALL propose_stories calls in a run, so splitting a batch can't dodge
+# the cap. agent.py calls reset_run() at the start of every run.
+_queued_this_run = 0
+_queued_stories: list[str] = []
+
+
+# Fault injection (M5 EV-3). CORTEX_FAULT=get_activity:3 makes the first 3 calls to
+# that tool fail like an upstream 500, then it works normally. Unset in normal runs.
+_faults_left: dict[str, int] = {}
+
+
+def reset_run() -> None:
+    global _queued_this_run
+    _queued_this_run = 0
+    _queued_stories.clear()
+    _faults_left.clear()
+    spec = os.environ.get("CORTEX_FAULT", "").strip()
+    if spec:
+        name, _, count = spec.partition(":")
+        _faults_left[name.strip()] = int(count or "1")
+
+
+def _with_fault(name: str, fn):
+    def call(**kwargs):
+        if _faults_left.get(name, 0) > 0:
+            _faults_left[name] -= 1
+            return {"error": "upstream_500", "injected": True, "tool": name,
+                    "hint": "transient upstream failure, a retry may succeed"}
+        return fn(**kwargs)
+    return call
+
+
+def withdraw_run() -> list[str]:
+    """Kill-switch rollback (M5): withdraw every story this run queued. Simulated in
+    the prototype, the queue only lives in the run output, there is no real tracker."""
+    global _queued_this_run
+    withdrawn = list(_queued_stories)
+    _queued_stories.clear()
+    _queued_this_run = 0
+    return withdrawn
 
 
 def _load_json(name: str) -> dict:
@@ -103,19 +143,23 @@ def get_norms(query: str = "") -> dict:
 
 def propose_stories(project_id: str, stories=None, reason: str = "") -> dict:
     """PROPOSE a set of backlog stories for a human to approve. This creates NOTHING
-    in the tracker, it queues a request. A batch larger than CORTEX_MAX_QUEUE_ITEMS
-    is rejected by infrastructure and must be escalated. This is the commitment bound,
-    enforced outside the model (M5)."""
+    in the tracker, it queues a request. A call that would take the run's total past
+    CORTEX_MAX_QUEUE_ITEMS is rejected by infrastructure and must be escalated. This
+    is the commitment bound, enforced outside the model (M5)."""
+    global _queued_this_run
     if isinstance(stories, str):
         stories = [stories]
     if not isinstance(stories, list):
         return {"error": "invalid_stories", "stories": stories}
-    if len(stories) > MAX_QUEUE_ITEMS:
+    if _queued_this_run + len(stories) > MAX_QUEUE_ITEMS:
         return {"status": "rejected",
-                "error": "batch_exceeds_queue_cap",
+                "error": "run_exceeds_queue_cap",
                 "count": len(stories),
+                "already_queued_this_run": _queued_this_run,
                 "cap_items": MAX_QUEUE_ITEMS,
                 "action": "escalate to a human, do not split the batch to dodge the cap"}
+    _queued_this_run += len(stories)
+    _queued_stories.extend(stories)
     return {"status": "queued_for_approval",
             "project_id": str(project_id).strip(),
             "count": len(stories),
@@ -136,3 +180,4 @@ TOOLS = {
     "get_norms": get_norms,
     "propose_stories": propose_stories,
 }
+TOOLS = {name: _with_fault(name, fn) for name, fn in TOOLS.items()}
