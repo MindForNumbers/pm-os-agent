@@ -16,7 +16,7 @@
 | **Auto-queue / commitment cap** | **5 stories per run**, counted across all `propose_stories` calls; over the cap is rejected and must escalate. Every batch so far was 2–5. | flooding the backlog; write-before-review |
 | **Permissions (JIT / ephemeral)** | Single-use token minted by my approval click, scoped to that draft (hash) and that channel. Burns on confirmed success, max 3 attempts, expires after 15 min, draft hash as idempotency key. **(not yet built: `post_team_update` doesn't exist; today there is no write tool at all)** | misused or leaked standing access; an edited draft riding on my approval; double-posts |
 | **Kill switch** | `run-output/state/KILL`, checked before start and before every model, tool, and critic call. Halts, withdraws this run's queued stories (**simulated**: stories only live in the run output today), revokes JIT tokens (once JIT is built), holds the draft, pings me. It can't unpost a sent message, which is why posting stays at a HITL checkpoint. Me or an eng on-call can set it; **only I can clear it (policy, not enforced in prototype)**. | a misbehaving agent I can't stop; Part A's "4 stories already queued" |
-| **HITL checkpoints** | Each story · team/project post · company-wide (Above, no tool ever) · status color change (code escalates) · what to escalate (Cortex only suggests) · flags + "possibly missed" (**soft bound**: the critic is independent and blocks on fail, but it's still a model; my HITL review is the hard backstop) · pre-authorization claims (inert via JIT; phrase detector is a signal only) | acting above the line without a human |
+| **HITL checkpoints** | Each story · team/project post · company-wide (Above, no tool ever) · status color change (code escalates) · what to escalate (Cortex only suggests) · flags + "possibly missed" (**soft bound**: the critic is the same model as the drafter, but a separate call with its own prompt and fresh context, so it never sees Cortex's reasoning; it blocks on fail, but it's still a model; my HITL review is the hard backstop) · pre-authorization claims (inert via JIT; phrase detector is a signal only) | acting above the line without a human |
 
 **Why Cortex has no standing write access (JIT).** Cortex has no standing write access because capability isn't permission. My jailbreak run proved why: the brief ordered a company-wide post of the Orbit roadmap, and the only thing that made it impossible was that Cortex had no tool to post. A prompt rule can be talked around; a missing credential can't. So write access exists only for the moment I approve, scoped to that one draft and channel, and it's burned on use. Even a confused or injected Cortex can only post what I already approved.
 
@@ -24,7 +24,7 @@
 
 ## 2. Failure-mode register
 
-"Code" = enforced outside any model (hard). "Model" = caught by the critic, an independent model (soft; my HITL review is the hard backstop).
+"Code" = enforced outside any model (hard). "Model" = caught by the critic (soft; my HITL review is the hard backstop). Same model as the drafter, but a separate call with its own prompt and fresh context: it never sees Cortex's reasoning. Using a different model for the critic is on the build list.
 
 | Failure mode | How detected | PM lever |
 |---|---|---|

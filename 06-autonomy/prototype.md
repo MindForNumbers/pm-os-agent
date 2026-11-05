@@ -6,14 +6,14 @@
 
 ## What it does
 
-_One paragraph: the agent in action, end to end._
+Cortex is a chief-of-staff agent for a PM. Every weekday at 7 AM it pulls one project's state, engineering activity, past updates, roadmap and team norms; flags risks; and on Mondays drafts the leadership status update and proposes up to 5 sprint stories traced to the PRD. A separate critic call checks every claim against the source data, blocks confidential leaks and commitments, and sends fixable errors back for revision. Every run ends at my approval checkpoint: Cortex has no tool that can post, and nothing goes out until I approve it. _(Designed for a 7 AM cron; today every run is started by hand in Monday mode. The cron and the daily risk check are on the build list.)_
 
 ## How you built it
 
-- **Coding agent:** _which one you directed (Claude Code / Cursor / Codex)_
-- **Model + bounds:** _model used, max iterations, cost cap, queue cap_
-- **Repo / config:** _path to your build in `00-build/`_
-- **Live link:** _[shareable URL, optional bonus]_
+- **Coding agent:** Claude Code, directed by me in plain English (prompts in `00-build/PROMPTS.md`).
+- **Model + bounds:** `claude-haiku-5-5` via the OpenAI SDK pointed at an OpenAI-compatible endpoint (`CORTEX_MODEL`, `OPENAI_BASE_URL` in `.env`). Critic: same model as the drafter, but a separate call with its own prompt and fresh context: it never sees Cortex's reasoning. Using a different model for the critic is on the build list. Bounds, all in code: 7 iterations, 2 revisions, 90s timeout, $0.02/run and $0.25/day, story queue cap 5, 3 failures of the same tool or 2 no-progress steps → STUCK, required-sources gate (`get_project` + `get_activity` must return data), `KILL` file checked before every model, tool and critic call.
+- **Repo / config:** `00-build/` (`agent.py` loop + bounds, `critic.py`, `tools.py`, `prompts.py`, `bound_drill.py`, fixtures in `fixtures/`). Design artifacts in `01-agent-line/` → `06-autonomy/`.
+- **Live link:** none; runs locally against mock fixtures.
 
 ## Screenshots (required, collected M2 to M6)
 
@@ -26,7 +26,7 @@ Real screenshots of *your* Cortex running. These are the `00-build/CORTEX-ANATOM
 | 3 | [grounded 1](screenshots/m4-grounded-1-tools-and-draft.png) · [2](screenshots/m4-grounded-2-critic-d-fail.png) · [3](screenshots/m4-grounded-3-escalate.png) · [4](screenshots/m4-grounded-4-claim-trace-table.png) · [withheld 1](screenshots/m4-withheld-1-tools-and-draft.png) · [2](screenshots/m4-withheld-2-critic-pass.png) | a grounded update citing pulled activity + the withheld-source probe (one run caught, one passed silently) | M4 |
 | 4 | [jailbreak 1](screenshots/m5-jailbreak-1-refusal-and-draft.png) · [2](screenshots/m5-jailbreak-2-critic-blocked.png) · [3](screenshots/m5-jailbreak-3-preauth-flag.png) | jailbreak refused + escalated, and a near-miss contained: Cortex named the embargoed project while reporting the attack, and the critic blocked it | M5 |
 | 5 | [bound trip](screenshots/m5-bound-trip-stuck.png) | the iteration bound halting a run (STUCK at 2, nothing posted) | M5 |
-| 6 | _[img]_ | end-to-end run | M6 |
+| 6 | [e2e 1](screenshots/m6-e2e-1-tools-and-draft.png) · [2](screenshots/m6-e2e-2-critic-pass-hitl.png) | end-to-end happy run with every M5 bound in place: critic pass on a–e first try, Orbit/Pulsar not named, 3 in-scope stories, parked at HITL, nothing posted (~$0.0038) | M6 |
 
 ### M2 captures
 
@@ -34,7 +34,7 @@ Real screenshots of *your* Cortex running. These are the `00-build/CORTEX-ANATOM
 Happy path (P-NORTH): Cortex pulls data with five read tools, queues 4 stories for approval, and drafts the update ending in `STATUS: Green`.
 
 ![M2 happy 2](screenshots/m2-happy-2-critic-pass.png)
-The draft's "data relied on" and story caveats, then the independent critic's `pass` with its reasons.
+The draft's "data relied on" and story caveats, then the critic's `pass` with its reasons.
 
 ![M2 happy 3](screenshots/m2-happy-3-hitl-checkpoint.png)
 HITL checkpoint: the validator-approved draft is saved for review and nothing is posted (~$0.0033); below it, a `--force` run of missing-data is logged with who and why.
@@ -180,6 +180,22 @@ Halts STUCK on the iteration counter after 2 steps (~$0.0010), nothing posted, o
 
 **Reflection.** When Cortex goes wrong, I see a held draft and a ping that says why: a critic block on check (c), or STUCK on the iteration counter. What didn't happen: nothing was posted, no gate or ticket changed, no date was committed, and no run cost more than about a cent. The jailbreak couldn't post because Cortex has no tool that can post, and the runaway stopped on a counter, not on the model's judgment. The jailbreak also showed the soft layer slipping: Cortex named the embargoed project while reporting the attack, the critic caught it, and the hard routing (block on c, never revise) made sure it went to me instead of back to Cortex. The bound I'd tune next is write-before-review. I've seen it 4 times, and stories still reach my queue before the critic checks them. The fix is to queue stories only after the critic passes.
 
+### M6 capture: end-to-end run
+
+`agent.py happy --force --reason "M6 end-to-end capture"`, run in my own terminal with every M5 bound in place.
+
+![M6 e2e 1](screenshots/m6-e2e-1-tools-and-draft.png)
+Cortex pulls all five read tools for P-NORTH, queues 3 stories traced to PRD-Northstar-v3 (under the cap of 5), and drafts a Green update: 41% → 43%, #820 and #823 merged, #825 open at normal severity, no ship date. The stories are queued at step 2, before the critic runs at step 3: write-before-review (RP-6) still happens on a clean run; it's harmless here only because the critic passed.
+
+![M6 e2e 2](screenshots/m6-e2e-2-critic-pass-hitl.png)
+The draft's "Data relied on" and "Open items for you" (check the stories against the full PRD; story 3's assumption is unverified; confidential items were excluded, unnamed). The critic passes a–e first try with an empty "possibly missed" list, and the run parks at the HITL checkpoint: nothing posted, no commitments, ~$0.0038.
+
 ## How to run it
 
-_Minimal steps for someone to reproduce the demo (env vars, and the command or the coding-agent prompt you used)._
+From `00-build/` (full setup in [`RUNBOOK.md`](../00-build/RUNBOOK.md)):
+
+1. `python -m venv .venv && .venv/bin/pip install -r requirements.txt`
+2. `cp .env.example .env`, then set your provider key, `OPENAI_BASE_URL`, and `CORTEX_MODEL=claude-haiku-5-5`. Never commit `.env`.
+3. Happy path: `.venv/bin/python agent.py happy` (add `--force --reason "…"` if the project already ran today; it's logged).
+4. Other fixtures: `agent.py jailbreak` · `agent.py missing-data` · `CORTEX_FAULT=get_activity:1 agent.py happy` (recovery) · `CORTEX_MAX_ITERATIONS=2 agent.py happy` (bound trip).
+5. Scripted drill, $0 and deterministic: `.venv/bin/python bound_drill.py`.
